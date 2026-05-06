@@ -1,7 +1,7 @@
 #!/bin/bash
 #$ -cwd
 #$ -N gamm_fs
-#$ -t 1-2
+#$ -t 1-4
 #$ -l h_rt=8:00:00
 #$ -l h_data=32G
 #$ -pe shared 4
@@ -25,7 +25,7 @@
 . /u/local/Modules/default/init/bash
 
 # Map array task ID → dataset name
-DATASETS=(male_parent male_youth)
+DATASETS=(male_parent male_youth female_parent female_youth)
 DS=${DATASETS[$((SGE_TASK_ID - 1))]}
 
 echo "============================================"

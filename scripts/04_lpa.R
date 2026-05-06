@@ -21,7 +21,11 @@ suppressPackageStartupMessages({
 
 set.seed(90025)
 
-LPA_VARS <- c("timing", "peak_velocity", "tempo_at_onset")
+# timing  = age at onset (first cross of PDS threshold)
+# tempo   = avg PDS gain per year from onset to completion (GAMM-derived, m=2)
+# obs_tempo = OLS slope of observed pds_comp ~ age (empirical, model-independent)
+# Use tempo as the primary; obs_tempo is a cross-check / fallback.
+LPA_VARS <- c("timing", "tempo", "peak_velocity")
 N_PROFILES <- 1:6
 # tidyLPA model numbers (mclust parameterisation):
 #   1 = EEI  equal variance, zero covariance
@@ -104,16 +108,10 @@ build_averaged <- function(sex) {
     by = "id"
   ) %>%
     mutate(
-      timing = rowMeans(cbind(timing_p, timing_y), na.rm = TRUE),
-      peak_velocity = rowMeans(
-        cbind(peak_velocity_p, peak_velocity_y),
-        na.rm = TRUE
-      ),
-      tempo_at_onset = rowMeans(
-        cbind(tempo_at_onset_p, tempo_at_onset_y),
-        na.rm = TRUE
-      ),
-      dataset = paste0(sex, "_averaged"),
+      timing        = rowMeans(cbind(timing_p,        timing_y),        na.rm = TRUE),
+      tempo         = rowMeans(cbind(tempo_p,         tempo_y),         na.rm = TRUE),
+      peak_velocity = rowMeans(cbind(peak_velocity_p, peak_velocity_y), na.rm = TRUE),
+      dataset  = paste0(sex, "_averaged"),
       reporter = "averaged"
     ) %>%
     select(id, dataset, reporter, all_of(LPA_VARS))
@@ -349,7 +347,8 @@ run_lpa <- function(df, label) {
       variable = factor(
         variable,
         levels = LPA_VARS,
-        labels = c("Timing (age at onset)", "Peak velocity", "Tempo at onset")
+        labels = c("Timing (age at onset)", "Tempo (PDS/yr, onset→completion)",
+                   "Peak velocity (PDS/yr)")
       ),
       Class = factor(Class)
     )

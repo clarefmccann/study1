@@ -8,11 +8,14 @@
 ##   nthreads: integer, default 4
 ##
 ## Model:
-##   pds_comp ~ s(age, k=6) + s(age, id_fac, bs="fs", k=6, m=1)
+##   pds_comp ~ s(age, k=6) + s(age, id_fac, bs="fs", k=4, m=2)
 ##   s(age): population mean trajectory
 ##   s(age, id_fac, bs="fs"): individual deviations (random smooth slopes)
-##   m=1 penalizes first derivative of individual deviation → pulls each
-##   person's curve toward flat (random intercept + slope prior).
+##   m=2 penalizes second derivative of individual deviation → allows each
+##   person's curve to deviate linearly from population (random intercepts
+##   AND slopes). This is critical: m=1 would penalize first derivative,
+##   collapsing individuals to random intercepts only and making tempo a
+##   mathematical function of timing.
 
 ## to do: add model for each item (other than pete for females, since its binary. that would need to be a different model?)
 
@@ -115,7 +118,7 @@ if (file.exists(rds_path)) {
   cat("\nFitting factor-smooth GAMM (this takes a while)...\n")
   m <- mgcv::bam(
     pds_comp ~ s(age, k = 6) +
-      s(age, id_fac, bs = "fs", k = 4, m = 1),
+      s(age, id_fac, bs = "fs", k = 4, m = 2),
     data = df,
     method = "fREML",
     discrete = TRUE,
@@ -177,30 +180,65 @@ deriv_mat[2:(AGE_FINE_N - 1), ] <-
 
 cat("Deriving timing and tempo...\n")
 
-timing_vec <- rep(NA_real_, n_ids)
+# Completion = when predicted PDS reaches 95% of the individual's predicted max.
+# tempo = (PDS_at_completion - PDS_at_onset) / (age_at_completion - age_at_onset)
+#         i.e. average PDS gain per year during the active pubertal window.
+# With m=2 in the fs smooth, individual deviations can be linear in age
+# (random intercepts + slopes), so peak_velocity and tempo genuinely vary
+# across individuals rather than being fixed by the population curve shape.
+PDS_COMPLETION_PCT <- 0.95
+
+timing_vec        <- rep(NA_real_, n_ids)
 peak_velocity_vec <- rep(NA_real_, n_ids)
-tempo_onset_vec <- rep(NA_real_, n_ids)
+duration_vec      <- rep(NA_real_, n_ids)
+tempo_vec         <- rep(NA_real_, n_ids)
 
 for (j in seq_len(n_ids)) {
   traj <- pred_mat[, j]
-  d <- deriv_mat[, j]
+  d    <- deriv_mat[, j]
   cross <- which(traj >= PDS_ONSET_THRESH)
   if (length(cross) > 0) {
-    onset_idx <- cross[1]
+    onset_idx  <- cross[1]
     timing_vec[j] <- age_fine[onset_idx]
-    tempo_onset_vec[j] <- d[onset_idx]
+
+    # completion: first point at/after onset where PDS >= 95% of individual max
+    ind_max   <- max(traj, na.rm = TRUE)
+    compl     <- which(traj[onset_idx:length(traj)] >= PDS_COMPLETION_PCT * ind_max)
+    if (length(compl) > 0) {
+      compl_idx <- onset_idx + compl[1] - 1L
+      dur <- age_fine[compl_idx] - age_fine[onset_idx]
+      duration_vec[j] <- dur
+      if (dur > 0) {
+        tempo_vec[j] <- (traj[compl_idx] - traj[onset_idx]) / dur
+      }
+    }
   }
   peak_velocity_vec[j] <- max(d, na.rm = TRUE)
 }
 
+# Empirical tempo: OLS slope of observed pds_comp ~ age per person.
+# This is independent of the GAMM penalty and serves as a direct check.
+obs_slopes <- df %>%
+  group_by(id) %>%
+  filter(n() >= 2L) %>%
+  summarise(
+    obs_tempo = tryCatch(
+      coef(lm(pds_comp ~ age))[["age"]],
+      error = function(e) NA_real_
+    ),
+    .groups = "drop"
+  )
+
 timing_tempo <- data.frame(
-  id = id_levels,
-  timing = timing_vec,
+  id            = id_levels,
+  timing        = timing_vec,
   peak_velocity = peak_velocity_vec,
-  tempo_at_onset = tempo_onset_vec,
-  dataset = ds_name,
+  duration      = duration_vec,
+  tempo         = tempo_vec,
+  dataset       = ds_name,
   stringsAsFactors = FALSE
-)
+) %>%
+  left_join(obs_slopes, by = "id")
 
 cat(
   "N with timing:",
