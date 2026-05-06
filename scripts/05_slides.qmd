@@ -1,0 +1,679 @@
+---
+title: "Pubertal Timing & Tempo"
+subtitle: "Individual Differences in the ABCD Cohort — Study 1"
+author: "Clare McCann"
+date: today
+format:
+  revealjs:
+    theme: simple
+    slide-number: true
+    echo: false
+    warning: false
+    message: false
+    fig-align: center
+    transition: slide
+    footer: "McCann — Study 1"
+    smaller: true
+---
+
+```{r setup}
+#| include: false
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+
+# export DATA_DIR="/u/project/silvers/data/ABCD/ABCD-release-6.0/cfm/physical-health/puberty"
+# export OUT_DIR="/u/home/c/clarefmc/projects/abcd-projs/dissertation/study1/outputs"
+# quarto render 05_slides.qmd
+
+# Output path detection — mirrors 03/04 scripts
+root <- Sys.getenv("HOME_DIR")
+if (!nzchar(root)) {
+  root <- Sys.getenv("HOME")
+}
+
+out_base <- Sys.getenv("OUT_DIR")
+if (!nzchar(out_base)) {
+  out_base <- file.path(
+    root,
+    "Library/CloudStorage/Box-Box/everything/projects/abcd-projs",
+    "dissertation/study1/outputs"
+  )
+}
+gamm_dir  <- file.path(out_base, "gamm")
+lpa_dir   <- file.path(out_base, "lpa")
+psych_dir <- file.path(out_base, "psychometrics")
+reg_dir   <- file.path(out_base, "regression")
+ds_names <- c("female_parent", "female_youth", "male_parent", "male_youth")
+
+# Load timing/tempo summaries for sample size tables
+tt_list <- lapply(ds_names, function(ds) {
+  p <- file.path(gamm_dir, paste0(ds, "_timing_tempo.csv"))
+  if (file.exists(p)) read.csv(p) else NULL
+})
+names(tt_list) <- ds_names
+
+# Load LPA best-solutions summary if available
+lpa_summary_path <- file.path(lpa_dir, "lpa_best_solutions_summary.csv")
+lpa_summary <- if (file.exists(lpa_summary_path)) {
+  read.csv(lpa_summary_path)
+} else {
+  NULL
+}
+
+# Helper: display image or placeholder text
+img <- function(path, width = "90%") {
+  if (file.exists(path)) {
+    knitr::include_graphics(path)
+  } else {
+    cat(paste0("*Output not yet available:* `", basename(path), "`"))
+  }
+}
+```
+
+# Background {background-color="#f5f5f5"}
+
+## Puberty as a Process
+
+- Puberty is not a single event — it unfolds across years with meaningful individual variation
+- Two key dimensions:
+  - **Timing** — when pubertal development begins
+  - **Tempo** — how rapidly it progresses
+- These are theoretically and empirically distinct yet often conflated
+
+::: {.notes}
+Motivate why we need to separate timing from tempo. Most prior work uses cross-sectional age-adjusted scores or single-timepoint assessments that can't disentangle these.
+:::
+
+## Study Aims
+
+1. **Characterize population-level pubertal trajectories** using factor-smooth GAMMs
+   - Fit a shared population curve + person-specific deviation in a single model (`mgcv::bam()`)
+   - Separates *when* puberty occurs from *how fast* it progresses — without a two-stage approach
+
+2. **Extract individual-level timing & tempo** estimates for each participant
+   - **Timing**: age at which each person's fitted trajectory first crosses PDS = 3.0
+   - **Peak velocity**: steepest rate of change — max d(PDS)/d(age) over the age range
+   - **Tempo at onset**: growth rate at the moment puberty begins
+
+3. **Identify latent pubertal profiles** via Latent Profile Analysis
+   - Cluster on timing, peak velocity, and tempo at onset (z-scored within sample)
+   - `tidyLPA`/mclust: K = 1–6 profiles × 4 covariance structures
+   - Model selection by BIC + entropy (class separation ≥ 0.80)
+
+4. [*Downstream: link profiles to outcomes — next script*]
+
+::: {.notes}
+Fill in aim 4 once downstream analyses are complete.
+:::
+
+# Sample {background-color="#f5f5f5"}
+
+## ABCD Study — Pubertal Data
+
+```{r sample-table}
+sample_tbl <- bind_rows(lapply(names(tt_list), function(ds) {
+  d <- tt_list[[ds]]
+  if (is.null(d)) return(data.frame(Dataset = ds, N_participants = NA,
+                                     N_with_timing = NA, Pct_timing = NA))
+  data.frame(
+    Dataset        = ds,
+    N_participants = n_distinct(d$id),
+    N_with_timing  = sum(!is.na(d$timing)),
+    Pct_timing     = round(mean(!is.na(d$timing)) * 100, 1)
+  )
+}))
+
+knitr::kable(
+  sample_tbl,
+  col.names = c("Dataset", "N participants", "N with timing estimate", "% with timing"),
+  align     = "lrrr"
+)
+```
+
+::: {.notes}
+Participants without a timing estimate never crossed the onset threshold (PDS composite ≥ 2.0) within the observed age range — likely very early or very late developers relative to the measurement window.
+:::
+
+## Measures
+
+- **PDS (Pubertal Development Scale)** — parent and youth report, annual waves
+- **Composite score**: mean of 4 items (body hair, sex-specific item, skin changes, petb)
+- Binary items (menarche / facial hair) modelled separately with binomial family
+- Up to 7 waves (baseline through follow-up 6)
+
+# Regression Characteristics {background-color="#f5f5f5"}
+
+## What Is Item-Level Regression?
+
+- PDS items are ordinal (1–4); puberty is biologically irreversible
+- **Regression**: a participant's score on an item *decreases* from one wave to the next
+- Apparent regression can arise from:
+  - Measurement error / inattentive responding
+  - **Caregiver switching** — a new reporter with no prior knowledge of the child
+- Understanding regression rates informs how we treat the longitudinal composite
+
+## Regression Prevalence
+
+```{r reg-participant-table}
+ps_path <- file.path(reg_dir, "reg_participant_summary.csv")
+if (file.exists(ps_path)) {
+  ps <- read.csv(ps_path)
+  ps %>%
+    group_by(group) %>%
+    summarise(
+      N = n(),
+      `% ever regressed` = round(mean(ever_regressed, na.rm = TRUE) * 100, 1),
+      `Mean regression events` = round(mean(total_regressions, na.rm = TRUE), 2),
+      `Mean waves with regression` = round(mean(n_waves_w_regression, na.rm = TRUE), 2),
+      .groups = "drop"
+    ) %>%
+    knitr::kable(align = "lrrrr")
+} else {
+  cat("*Run 01_regression_characterization.R first.*")
+}
+```
+
+## Item-Level Regression Rates
+
+```{r item-reg-plot}
+#| out-width: "95%"
+img(file.path(reg_dir, "item_regression_rates.png"))
+```
+
+::: {.notes}
+Each bar shows the % of wave-to-wave transitions where that item's score decreased. Higher rates suggest noisier items or items more susceptible to caregiver switching.
+:::
+
+## Regression Rate by Wave
+
+```{r wave-reg-plot}
+#| out-width: "95%"
+img(file.path(reg_dir, "wave_regression_rates.png"))
+```
+
+::: {.notes}
+Earlier waves may show higher rates if children are still in early puberty and scores fluctuate around the floor. Later waves may show higher rates due to increased caregiver switching.
+:::
+
+## Caregiver Switching
+
+:::: {.columns}
+::: {.column width="55%"}
+```{r cg-reg-plot}
+#| out-width: "100%"
+img(file.path(reg_dir, "caregiver_switch_regression.png"))
+```
+:::
+::: {.column width="45%"}
+```{r cg-summary-table}
+cg_path <- file.path(reg_dir, "caregiver_switch_summary.csv")
+if (file.exists(cg_path)) {
+  cg <- read.csv(cg_path)
+  knitr::kable(
+    cg %>%
+      mutate(
+        `% ever switched` = round(pct_ever_switched * 100, 1),
+        `Mean switches` = round(mean_switches, 2)
+      ) %>%
+      select(sex, reporter, n, `% ever switched`, `Mean switches`),
+    align = "llrrr"
+  )
+} else {
+  cat("*Run 01_regression_characterization.R first.*")
+}
+```
+:::
+::::
+
+::: {.notes}
+Regression coinciding with a caregiver switch is expected — the new caregiver doesn't know the child's prior pubertal status. Regression without a switch is more indicative of measurement error.
+:::
+
+## Predictors of Regression
+
+```{r reg-model-table}
+mod_path <- file.path(reg_dir, "reg_predictors_models.csv")
+if (file.exists(mod_path)) {
+  reg_mod <- read.csv(mod_path)
+  reg_mod %>%
+    filter(effect == "fixed", term != "(Intercept)") %>%
+    select(group, term, estimate, conf.low, conf.high, p.value) %>%
+    mutate(across(c(estimate, conf.low, conf.high), ~ round(., 2)),
+           p.value = round(p.value, 3)) %>%
+    knitr::kable(
+      col.names = c("Dataset", "Predictor", "OR", "95% CI low", "95% CI high", "p"),
+      caption = "Mixed logistic regression: predictors of any item regression (OR scale)"
+    )
+} else {
+  cat("*Run 01_regression_characterization.R first.*")
+}
+```
+
+# Psychometrics {background-color="#f5f5f5"}
+
+## Measurement Validation — Overview
+
+- **4 datasets**: female × {parent, youth}, male × {parent, youth}; up to 7 annual waves
+- **Items**: peta (pubic hair), petb (growth spurt), petc (skin), petd (body odor) — all ordinal 1–4
+- Four analyses conducted prior to GAMM modelling:
+
+| Analysis | Question |
+|---|---|
+| GRM (per wave) | Which items discriminate best? |
+| 1-factor CFA (per wave) | Does a single puberty factor fit? |
+| Cross-reporter bifactor CFA | Are parent and youth measuring the same construct? |
+| Longitudinal measurement invariance | Are factor loadings/thresholds stable across waves? |
+
+## Item Discrimination — GRM
+
+- Graded Response Model fit separately for each sex × reporter × wave
+- Discrimination parameter *a* > 1.0 indicates good item–trait alignment
+- Items flagged if *a* < 0.7 at the majority of waves
+
+```{r disc-heatmap}
+#| out-width: "90%"
+img(file.path(psych_dir, "discrimination_heatmap.png"))
+```
+
+## Unidimensionality — CFA Fit
+
+```{r cfa-fits}
+cfa_path <- file.path(psych_dir, "cfa_fit_per_wave.csv")
+if (file.exists(cfa_path)) {
+  cfa_fits <- read.csv(cfa_path)
+  knitr::kable(
+    cfa_fits %>%
+      group_by(dataset) %>%
+      summarise(
+        across(c(cfi.scaled, tli.scaled, rmsea.scaled, srmr),
+               ~ round(mean(., na.rm = TRUE), 3)),
+        .groups = "drop"
+      ),
+    col.names = c("Dataset", "CFI", "TLI", "RMSEA", "SRMR"),
+    caption = "Average CFA fit across waves (WLSMV; target: CFI > .95, RMSEA < .06)"
+  )
+} else {
+  cat("*Run 02_psychometrics.R first.*")
+}
+```
+
+::: {.notes}
+One-factor CFA with WLSMV estimator. Fit is averaged across waves; wave-level table in supplementary materials.
+:::
+
+## Cross-Reporter Structure — Bifactor CFA
+
+- Three models compared per sex:
+  - **1-factor**: all 8 items load on one puberty factor
+  - **2-factor**: separate parent and youth factors (correlated)
+  - **Bifactor**: general puberty factor + orthogonal reporter method factors
+
+```{r bifactor-table}
+bf_path <- file.path(psych_dir, "bifactor_model_comparison.csv")
+if (file.exists(bf_path)) {
+  bf <- read.csv(bf_path)
+  knitr::kable(
+    bf %>% select(sex, model, cfi.scaled, tli.scaled, rmsea.scaled, srmr) %>%
+      mutate(across(where(is.numeric), ~ round(., 3))),
+    col.names = c("Sex", "Model", "CFI", "TLI", "RMSEA", "SRMR")
+  )
+} else {
+  cat("*Run 02_psychometrics.R first.*")
+}
+```
+
+::: {.notes}
+Omega_h from Schmid-Leiman decomposition quantifies how much variance the general factor explains relative to the method factors. High ECV + omega_h supports treating parent and youth reports as indicators of a common construct.
+:::
+
+## Longitudinal Measurement Invariance
+
+- Does the PDS factor structure hold across 7 annual waves?
+- Sequence: configural → metric → scalar → strict (WLSMV, θ parameterization)
+- Criterion: ΔCFI < −.010 indicates non-invariance
+
+```{r long-inv-table}
+li_path <- file.path(psych_dir, "longitudinal_invariance.csv")
+if (file.exists(li_path)) {
+  li <- read.csv(li_path)
+  knitr::kable(
+    li %>%
+      select(group, model, cfi.scaled, rmsea.scaled, delta_cfi) %>%
+      mutate(across(where(is.numeric), ~ round(., 3))),
+    col.names = c("Dataset", "Model", "CFI", "RMSEA", "ΔCFI")
+  )
+} else {
+  cat("*Run 02_psychometrics.R first.*")
+}
+```
+
+::: {.notes}
+Scalar invariance (equal loadings + thresholds across waves) is required for valid comparison of latent means over time — i.e., for the GAMM trajectories to be interpretable as change in a common construct.
+:::
+
+# Analytic Approach {background-color="#f5f5f5"}
+
+## Factor-Smooth GAMMs
+
+$$\text{PDS}_{it} = f(\text{age}_t) + f_i(\text{age}_t) + \varepsilon_{it}$$
+
+- $f(\text{age})$: **population mean trajectory** (shared smooth)
+- $f_i(\text{age})$: **person-specific deviation** (factor smooth, `bs="fs"`)
+- First-derivative penalty (`m=1`) shrinks individual curves toward the population mean
+- Fitted via `mgcv::bam()` with `discrete=TRUE` for scalability at ABCD $N$
+
+::: {.notes}
+The factor-smooth approach avoids the limitation of two-stage methods (extract timing then regress) by estimating individual trajectories directly within a single model.
+:::
+
+## What We Extract
+
+From each person's fitted trajectory $\hat{y}_i(\text{age})$:
+
+| Construct | Definition |
+|-----------|-----------|
+| **Timing** | Age at which $\hat{y}_i$ first crosses PDS = 2.0 |
+| **Peak velocity** | $\max_t \frac{d\hat{y}_i}{dt}$ — steepest rate of change |
+| **Tempo at onset** | $\frac{d\hat{y}_i}{dt}$ evaluated at the timing age |
+
+::: {.notes}
+Peak velocity captures how fast puberty progresses regardless of when it starts — the key feature of this approach vs. timing-only measures.
+:::
+
+# Population Trajectories {background-color="#f5f5f5"}
+
+## Females — Population Smooth
+
+:::: {.columns}
+::: {.column width="50%"}
+**Parent report**
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "female_parent_population_smooth.png"))
+```
+:::
+::: {.column width="50%"}
+**Youth report**
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "female_youth_population_smooth.png"))
+```
+:::
+::::
+
+## Males — Population Smooth
+
+:::: {.columns}
+::: {.column width="50%"}
+**Parent report**
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "male_parent_population_smooth.png"))
+```
+:::
+::: {.column width="50%"}
+**Youth report**
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "male_youth_population_smooth.png"))
+```
+:::
+::::
+
+## Pubertal Velocity — Females
+
+:::: {.columns}
+::: {.column width="50%"}
+**Parent report**
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "female_parent_growth_velocity.png"))
+```
+:::
+::: {.column width="50%"}
+**Youth report**
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "female_youth_growth_velocity.png"))
+```
+:::
+::::
+
+## Pubertal Velocity — Males
+
+:::: {.columns}
+::: {.column width="50%"}
+**Parent report**
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "male_parent_growth_velocity.png"))
+```
+:::
+::: {.column width="50%"}
+**Youth report**
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "male_youth_growth_velocity.png"))
+```
+:::
+::::
+
+# Individual Timing & Tempo {background-color="#f5f5f5"}
+
+## Distribution of Onset Age
+
+:::: {.columns}
+::: {.column width="50%"}
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "female_parent_timing_dist.png"))
+```
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "male_parent_timing_dist.png"))
+```
+:::
+::: {.column width="50%"}
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "female_youth_timing_dist.png"))
+```
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "male_youth_timing_dist.png"))
+```
+:::
+::::
+
+## Distribution of Peak Velocity
+
+:::: {.columns}
+::: {.column width="50%"}
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "female_parent_peak_velocity_dist.png"))
+```
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "male_parent_peak_velocity_dist.png"))
+```
+:::
+::: {.column width="50%"}
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "female_youth_peak_velocity_dist.png"))
+```
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "male_youth_peak_velocity_dist.png"))
+```
+:::
+::::
+
+## Timing vs. Peak Velocity
+
+:::: {.columns}
+::: {.column width="50%"}
+**Females**
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "female_parent_timing_vs_velocity.png"))
+```
+:::
+::: {.column width="50%"}
+**Males**
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "male_parent_timing_vs_velocity.png"))
+```
+:::
+::::
+
+::: {.notes}
+If timing and peak velocity are moderately correlated, that motivates the LPA — we want to find people who are not just early/late but also fast/slow in ways that cluster naturally.
+:::
+
+# Latent Profile Analysis {background-color="#f5f5f5"}
+
+## LPA Overview
+
+- **Variables**: timing, peak velocity, tempo at onset (all z-scored within sample)
+- **Method**: `tidyLPA` (wrapping `mclust`)
+- **Covariance structures compared**: EEI, VVI, EEE, VVV
+- **Profiles searched**: K = 1–6
+- **Selection criteria**: BIC (primary) + entropy (separation quality, threshold > 0.80)
+- **Six solutions**: female × {parent, youth, averaged}, male × {parent, youth, averaged}
+
+## Model Selection — Females
+
+:::: {.columns}
+::: {.column width="50%"}
+**BIC**
+```{r}
+#| out-width: "100%"
+img(file.path(lpa_dir, "female_parent_bic_plot.png"))
+```
+:::
+::: {.column width="50%"}
+**Entropy**
+```{r}
+#| out-width: "100%"
+img(file.path(lpa_dir, "female_parent_entropy_plot.png"))
+```
+:::
+::::
+
+## Model Selection — Males
+
+:::: {.columns}
+::: {.column width="50%"}
+**BIC**
+```{r}
+#| out-width: "100%"
+img(file.path(lpa_dir, "male_parent_bic_plot.png"))
+```
+:::
+::: {.column width="50%"}
+**Entropy**
+```{r}
+#| out-width: "100%"
+img(file.path(lpa_dir, "male_parent_entropy_plot.png"))
+```
+:::
+::::
+
+## Selected Solutions
+
+```{r lpa-solution-table}
+if (!is.null(lpa_summary)) {
+  knitr::kable(
+    lpa_summary,
+    col.names = c("Sample", "K (profiles)", "Model"),
+    align     = "lcc"
+  )
+} else {
+  cat("*LPA outputs not yet available — run 04\\_lpa.R first.*")
+}
+```
+
+## Pubertal Profiles — Females (Parent)
+
+```{r}
+#| out-width: "80%"
+if (!is.null(lpa_summary)) {
+  k <- lpa_summary$best_K[lpa_summary$label == "female_parent"]
+  if (length(k) > 0)
+    img(file.path(lpa_dir, paste0("female_parent_k", k, "_profile_plot.png")))
+} else {
+  cat("*Run 04\\_lpa.R to generate profile plots.*")
+}
+```
+
+## Pubertal Profiles — Females (Averaged)
+
+```{r}
+#| out-width: "80%"
+if (!is.null(lpa_summary)) {
+  k <- lpa_summary$best_K[lpa_summary$label == "female_averaged"]
+  if (length(k) > 0)
+    img(file.path(lpa_dir, paste0("female_averaged_k", k, "_profile_plot.png")))
+} else {
+  cat("*Run 04\\_lpa.R to generate profile plots.*")
+}
+```
+
+## Pubertal Profiles — Males (Parent)
+
+```{r}
+#| out-width: "80%"
+if (!is.null(lpa_summary)) {
+  k <- lpa_summary$best_K[lpa_summary$label == "male_parent"]
+  if (length(k) > 0)
+    img(file.path(lpa_dir, paste0("male_parent_k", k, "_profile_plot.png")))
+} else {
+  cat("*Run 04\\_lpa.R to generate profile plots.*")
+}
+```
+
+## Pubertal Profiles — Males (Averaged)
+
+```{r}
+#| out-width: "80%"
+if (!is.null(lpa_summary)) {
+  k <- lpa_summary$best_K[lpa_summary$label == "male_averaged"]
+  if (length(k) > 0)
+    img(file.path(lpa_dir, paste0("male_averaged_k", k, "_profile_plot.png")))
+} else {
+  cat("*Run 04\\_lpa.R to generate profile plots.*")
+}
+```
+
+# Summary {background-color="#f5f5f5"}
+
+## Key Takeaways
+
+::: {.incremental}
+- Factor-smooth GAMMs recover individual pubertal trajectories from longitudinal PDS data
+- Timing and peak velocity show substantial individual variation and are [moderately / weakly] correlated
+- LPA identifies [K] distinct pubertal profiles that differ in both *when* and *how fast* puberty unfolds
+- Reporter convergence: parent and youth solutions [converge / diverge] in...
+- Next: link profile membership to [outcomes]
+:::
+
+::: {.notes}
+Fill in the bracketed text once LPA results are in and you've looked at the comparison plots.
+:::
+
+## Thank You
+
+Questions?
+
+\vspace{1em}
+
+> *"Puberty is not just about when — it's about how fast."*
+
+::: {.notes}
+Optional closing quote placeholder — swap for something more fitting or remove.
+:::

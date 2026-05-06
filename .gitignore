@@ -1,0 +1,19 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Large model objects — recompute from scripts
+outputs/gamm/*.rds
+
+# macOS metadata on network/SSHFS mounts
+._*
+.DS_Store
+
+# HPC logs
+logs/
+
+# Quarto render artifacts
+*_files/
+*.html
