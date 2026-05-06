@@ -5,7 +5,8 @@
 *.Rproj
 
 # Large model objects — recompute from scripts
-outputs/gamm/*.rds
+outputs/
+
 
 # macOS metadata on network/SSHFS mounts
 ._*
@@ -17,3 +18,7 @@ logs/
 # Quarto render artifacts
 *_files/
 *.html
+
+.*
+archive/
+desc/
