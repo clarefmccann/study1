@@ -54,7 +54,7 @@ out_base <- Sys.getenv("OUT_DIR")
 if (!nzchar(out_base)) {
   out_base <- file.path(
     root_path,
-    "Library/CloudStorage/Box-Box/everything/projects/abcd-projs",
+    "projects/abcd-projs",
     "dissertation/study1/outputs"
   )
 }
@@ -143,22 +143,79 @@ run_lpa <- function(df, label) {
     mutate(across(all_of(LPA_VARS), ~ as.numeric(scale(.))))
 
   # --- Model comparison ---------------------------------------------------
+  # Estimate each model/k individually so failed mclust fits don't crash the
+  # whole comparison (compare_solutions() chokes on NULL fits with empty names).
   cat("Comparing models (this may take a few minutes)...\n")
-  comp <- df_z %>%
-    select(all_of(LPA_VARS)) %>%
-    compare_solutions(n_profiles = N_PROFILES, models = LPA_MODELS)
+  successful_fits <- list()
+  for (.m in LPA_MODELS) {
+    for (.k in N_PROFILES) {
+      .key <- paste0("m", .m, "_k", .k)
+      .fit <- tryCatch(
+        suppressWarnings(
+          df_z %>%
+            select(all_of(LPA_VARS)) %>%
+            estimate_profiles(n_profiles = .k, models = .m)
+        ),
+        error = function(e) NULL
+      )
+      if (!is.null(.fit)) {
+        .stats <- tryCatch(get_fit(.fit), error = function(e) NULL)
+        if (!is.null(.stats) && nrow(.stats) > 0) {
+          # Column names vary by tidyLPA/tibble version; match by pattern.
+          .bic_col <- grep("^BIC", names(.stats), value = TRUE)[1]
+          .ent_col <- grep(
+            "(?i)^entropy",
+            names(.stats),
+            value = TRUE,
+            perl = TRUE
+          )[1]
+          .bic_val <- if (!is.na(.bic_col)) {
+            as.numeric(.stats[[.bic_col]][1])
+          } else {
+            NA_real_
+          }
+          .ent_val <- if (!is.na(.ent_col)) {
+            as.numeric(.stats[[.ent_col]][1])
+          } else {
+            NA_real_
+          }
+          successful_fits[[.key]] <- list(
+            fit = .fit,
+            model = .m,
+            k = .k,
+            BIC = .bic_val,
+            Entropy = .ent_val
+          )
+        }
+      }
+    }
+  }
+
+  if (length(successful_fits) == 0) {
+    warning("No models converged for ", label, " — skipping.")
+    return(invisible(NULL))
+  }
+
+  fits_df <- bind_rows(lapply(successful_fits, function(x) {
+    data.frame(
+      Model = x$model,
+      Classes = x$k,
+      BIC = x$BIC,
+      Entropy = x$Entropy,
+      stringsAsFactors = FALSE
+    )
+  }))
 
   cat("\nFit statistics:\n")
-  print(comp)
+  print(fits_df)
 
-  fits_df <- comp$fits
   write.csv(
     fits_df,
     file.path(out_dir, paste0(label, "_model_comparison.csv")),
     row.names = FALSE
   )
 
-  # BIC plot (higher BIC = better in mclust convention)
+  # BIC plot (standard BIC: lower = better)
   p_bic <- ggplot(
     fits_df,
     aes(x = Classes, y = BIC, colour = factor(Model), group = factor(Model))
@@ -169,7 +226,7 @@ run_lpa <- function(df, label) {
     labs(
       title = paste("BIC by profiles and model —", label),
       x = "Number of profiles",
-      y = "BIC (higher = better)",
+      y = "BIC (lower = better)",
       colour = "Model"
     ) +
     theme_minimal(base_size = 12) +
@@ -209,15 +266,18 @@ run_lpa <- function(df, label) {
   )
 
   # --- Best solution (BIC-optimal) ----------------------------------------
-  best <- get_best_solution(comp)
-  best_k <- best$n_profiles
-  best_model <- best$model
+  # get_fit() returns standard BIC (lower = better); exclude K=1 since a
+  # single-component solution is not a meaningful LPA result.
+  valid_fits <- Filter(function(x) !is.na(x$BIC) && x$k > 1, successful_fits)
+  if (length(valid_fits) == 0) {
+    warning("No valid multi-profile BIC values for ", label, " — skipping.")
+    return(invisible(NULL))
+  }
+  best_key <- names(which.min(sapply(valid_fits, `[[`, "BIC")))
+  best_k <- valid_fits[[best_key]]$k
+  best_model <- valid_fits[[best_key]]$model
+  fit_best <- valid_fits[[best_key]]$fit
   cat("\nBIC-optimal solution: K =", best_k, "| model =", best_model, "\n")
-
-  # Re-estimate best solution to extract assignments + posteriors
-  fit_best <- df_z %>%
-    select(all_of(LPA_VARS)) %>%
-    estimate_profiles(n_profiles = best_k, models = best_model)
 
   assigns <- get_data(fit_best) %>%
     select(Class, starts_with("CPROB")) %>%
@@ -309,12 +369,19 @@ run_lpa <- function(df, label) {
 
   # --- Also save K = 2,3,4 of best model type for inspection --------------
   for (k in setdiff(2:4, best_k)) {
-    fit_k <- tryCatch(
-      df_z %>%
-        select(all_of(LPA_VARS)) %>%
-        estimate_profiles(n_profiles = k, models = best_model),
-      error = function(e) NULL
-    )
+    .key_k <- paste0("m", best_model, "_k", k)
+    fit_k <- if (!is.null(successful_fits[[.key_k]])) {
+      successful_fits[[.key_k]]$fit
+    } else {
+      tryCatch(
+        suppressWarnings(
+          df_z %>%
+            select(all_of(LPA_VARS)) %>%
+            estimate_profiles(n_profiles = k, models = best_model)
+        ),
+        error = function(e) NULL
+      )
+    }
     if (is.null(fit_k)) {
       next
     }
@@ -332,7 +399,7 @@ run_lpa <- function(df, label) {
 
   cat("Outputs written for", label, "\n")
   invisible(list(
-    comparison = comp,
+    comparison = fits_df,
     best_fit = fit_best,
     best_k = best_k,
     best_model = best_model
