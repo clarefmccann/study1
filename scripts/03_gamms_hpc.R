@@ -424,8 +424,12 @@ for (item in items) {
       discrete = TRUE,
       nthreads = n_threads
     )
-    cat(item, "fit in",
-        round((proc.time() - t_item)[["elapsed"]] / 60, 1), "min\n")
+    cat(
+      item,
+      "fit in",
+      round((proc.time() - t_item)[["elapsed"]] / 60, 1),
+      "min\n"
+    )
     saveRDS(m_item, item_rds)
   }
 
