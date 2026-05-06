@@ -21,18 +21,23 @@ suppressPackageStartupMessages({
 
 set.seed(90025)
 
-# timing  = age at onset (first cross of PDS threshold)
-# tempo   = avg PDS gain per year from onset to completion (GAMM-derived, m=2)
-# obs_tempo = OLS slope of observed pds_comp ~ age (empirical, model-independent)
-# Use tempo as the primary; obs_tempo is a cross-check / fallback.
-LPA_VARS <- c("timing", "tempo", "peak_velocity")
+# timing    = age at onset (first cross of PDS threshold)         [individual]
+# obs_tempo = OLS slope of observed pds_comp ~ age per person    [individual]
+# Excluded:
+#   tempo / gamm_tempo — derived from the population-level GAMM smooth, so
+#     near-constant across individuals (no meaningful individual variance).
+#   peak_velocity — population smooth's peak derivative; literally one value
+#     per dataset.
+LPA_VARS <- c("timing", "obs_tempo")
 N_PROFILES <- 1:6
 # tidyLPA model numbers (mclust parameterisation):
 #   1 = EEI  equal variance, zero covariance
 #   2 = VVI  varying variance, zero covariance
 #   3 = EEE  equal variance + covariance
-#   6 = VVV  varying variance + covariance  (most flexible)
-LPA_MODELS <- c(1, 2, 3, 6)
+# Model 6 (VVV) excluded: with only 3 LPA variables the full covariance matrix
+# is overparameterized, produces negative BIC, and collapses all variance into
+# the covariance structure rather than separating profiles on tempo/velocity.
+LPA_MODELS <- c(1, 2, 3)
 
 # ---------------------------------------------------------------------------
 # PATHS
@@ -108,10 +113,9 @@ build_averaged <- function(sex) {
     by = "id"
   ) %>%
     mutate(
-      timing        = rowMeans(cbind(timing_p,        timing_y),        na.rm = TRUE),
-      tempo         = rowMeans(cbind(tempo_p,         tempo_y),         na.rm = TRUE),
-      peak_velocity = rowMeans(cbind(peak_velocity_p, peak_velocity_y), na.rm = TRUE),
-      dataset  = paste0(sex, "_averaged"),
+      timing = rowMeans(cbind(timing_p, timing_y), na.rm = TRUE),
+      obs_tempo = rowMeans(cbind(obs_tempo_p, obs_tempo_y), na.rm = TRUE),
+      dataset = paste0(sex, "_averaged"),
       reporter = "averaged"
     ) %>%
     select(id, dataset, reporter, all_of(LPA_VARS))
@@ -132,7 +136,9 @@ extract_assignments <- function(fit) {
     get_data(fit) %>% select(Class, starts_with("CPROB")),
     error = function(e) NULL
   )
-  if (!is.null(result)) return(result)
+  if (!is.null(result)) {
+    return(result)
+  }
 
   # Fall back: pull the mclust object from the tidyProfile/tidyLPA structure
   mc <- NULL
@@ -143,10 +149,14 @@ extract_assignments <- function(fit) {
     function(f) f[[1]]$model_object
   )) {
     mc <- tryCatch(.acc(fit), error = function(e) NULL)
-    if (!is.null(mc) && inherits(mc, "Mclust")) break
+    if (!is.null(mc) && inherits(mc, "Mclust")) {
+      break
+    }
     mc <- NULL
   }
-  if (is.null(mc)) stop("Cannot extract class assignments from tidyLPA fit.")
+  if (is.null(mc)) {
+    stop("Cannot extract class assignments from tidyLPA fit.")
+  }
 
   probs <- as.data.frame(mc$z)
   names(probs) <- paste0("CPROB", seq_len(ncol(mc$z)))
@@ -166,6 +176,18 @@ run_lpa <- function(df, label) {
     warning("Too few complete cases for ", label, " — skipping.")
     return(invisible(NULL))
   }
+
+  # Winsorize at ±3 SD before z-scoring.
+  # obs_tempo has extreme right outliers (max ~10 SD above median); without
+  # winsorizing, scale() maps the bulk of the distribution to z ≈ 0 and LPA
+  # cannot distinguish profiles on tempo.
+  winsorise <- function(x, k = 3) {
+    m <- mean(x, na.rm = TRUE)
+    s <- sd(x, na.rm = TRUE)
+    pmax(pmin(x, m + k * s), m - k * s)
+  }
+  df_cc <- df_cc %>%
+    mutate(across(all_of(LPA_VARS), winsorise))
 
   # Standardise within this sample (LPA on z-scores; raw means saved separately)
   df_z <- df_cc %>%
@@ -317,8 +339,26 @@ run_lpa <- function(df, label) {
     row.names = FALSE
   )
 
-  # --- Profile means plot (raw scale) -------------------------------------
-  profile_means <- assigns %>%
+  # --- Profile means plot (z-score scale, faceted) ------------------------
+  # Raw-scale plot is misleading: timing (~8-15 yr) and obs_tempo (~0.2-0.4
+  # PDS/yr) are on incompatible scales; tempo differences are invisible on a
+  # shared y-axis. Faceted z-score plot gives each variable its own axis.
+  profile_means_raw <- assigns %>%
+    group_by(Class) %>%
+    summarise(
+      n = n(),
+      across(
+        all_of(LPA_VARS),
+        list(mean = mean, se = ~ sd(.) / sqrt(n())),
+        .names = "{.col}__{.fn}"
+      ),
+      .groups = "drop"
+    )
+
+  # Also compute profile means on the z-scored data (what LPA actually saw)
+  assigns_z <- assigns %>%
+    mutate(across(all_of(LPA_VARS), ~ as.numeric(scale(.))))
+  profile_means_z <- assigns_z %>%
     group_by(Class) %>%
     summarise(
       n = n(),
@@ -331,39 +371,40 @@ run_lpa <- function(df, label) {
     )
 
   write.csv(
-    profile_means,
+    profile_means_raw,
     file.path(out_dir, paste0(label, "_k", best_k, "_profile_means.csv")),
     row.names = FALSE
   )
 
-  # Pivot for plotting
-  pm_long <- profile_means %>%
+  var_labels <- c(
+    "Timing (age at onset, yr)",
+    "Tempo (OLS slope, PDS/yr)"
+  )
+
+  # Pivot z-score means for faceted plot
+  pm_long_z <- profile_means_z %>%
     pivot_longer(
       cols = ends_with("__mean") | ends_with("__se"),
       names_to = c("variable", ".value"),
       names_sep = "__"
     ) %>%
     mutate(
-      variable = factor(
-        variable,
-        levels = LPA_VARS,
-        labels = c("Timing (age at onset)", "Tempo (PDS/yr, onset→completion)",
-                   "Peak velocity (PDS/yr)")
-      ),
+      variable = factor(variable, levels = LPA_VARS, labels = var_labels),
       Class = factor(Class)
     )
 
   p_prof <- ggplot(
-    pm_long,
-    aes(x = variable, y = mean, colour = Class, group = Class)
+    pm_long_z,
+    aes(x = Class, y = mean, colour = Class, group = Class)
   ) +
-    geom_line(linewidth = 0.9) +
     geom_point(size = 3) +
     geom_errorbar(
       aes(ymin = mean - 2 * se, ymax = mean + 2 * se),
-      width = 0.15,
-      linewidth = 0.6
+      width = 0.2,
+      linewidth = 0.7
     ) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+    facet_wrap(~variable, scales = "free_y") +
     labs(
       title = paste0(
         "Pubertal profiles — ",
@@ -374,19 +415,16 @@ run_lpa <- function(df, label) {
         best_model,
         ")"
       ),
-      x = NULL,
-      y = "Mean (raw scale)",
+      x = "Profile",
+      y = "Mean (z-score ± 2 SE)",
       colour = "Profile",
       caption = paste0(
         "n per profile: ",
-        paste(profile_means$n, collapse = " / ")
+        paste(profile_means_raw$n, collapse = " / ")
       )
     ) +
     theme_minimal(base_size = 13) +
-    theme(
-      axis.text.x = element_text(angle = 20, hjust = 1),
-      legend.position = "bottom"
-    )
+    theme(legend.position = "none")
 
   ggsave(
     file.path(out_dir, paste0(label, "_k", best_k, "_profile_plot.png")),

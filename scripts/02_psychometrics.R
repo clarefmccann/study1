@@ -353,7 +353,8 @@ write.csv(
 
 build_cr_data <- function(parent_df, youth_df, include_pete = FALSE) {
   base_items <- c("peta", "petb", "petc", "petd")
-  all_items <- if (include_pete) c(base_items, "pete") else base_items
+  # fpete (female) and mpete (male) are sex-specific; any_of() picks whichever exists
+  all_items <- if (include_pete) c(base_items, "fpete", "mpete") else base_items
 
   parent_sel <- parent_df %>%
     select(id, wave, any_of(all_items)) %>%
@@ -427,30 +428,33 @@ run_bifactor_section <- function(
   cr_items_p <- grep("_p$", cr_items, value = TRUE)
   cr_items_y <- grep("_y$", cr_items, value = TRUE)
 
-  # lavaan: Model A — two correlated factors (parent | youth)
-  mod_2f <- paste0(
-    "parent =~ ",
+  # Model 1: no puberty trait, freely correlated method factors
+  # Items cluster only by reporter; no shared latent construct.
+  mod_m1 <- paste0(
+    "method_p =~ ",
     paste(cr_items_p, collapse = " + "),
     "\n",
-    "youth  =~ ",
+    "method_y =~ ",
     paste(cr_items_y, collapse = " + ")
   )
-  fit_2f <- tryCatch(
+  fit_m1 <- tryCatch(
     lavaan::cfa(
-      mod_2f,
+      mod_m1,
       data = dat,
       ordered = cr_items,
       estimator = "WLSMV",
       missing = "pairwise"
     ),
     error = function(e) {
-      message("2-factor CFA failed: ", e$message)
+      message("Model 1 (no trait) failed: ", e$message)
       NULL
     }
   )
 
-  # lavaan: Model B — bifactor (general + parent method + youth method)
-  mod_bf <- paste0(
+  # Model 2: puberty trait + freely correlated method factors
+  # General factor ⊥ each method factor (bifactor constraint); method factors
+  # are free to correlate with each other — parses shared vs. reporter-unique variance.
+  mod_m2 <- paste0(
     "general  =~ ",
     paste(cr_items, collapse = " + "),
     "\n",
@@ -458,35 +462,38 @@ run_bifactor_section <- function(
     paste(cr_items_p, collapse = " + "),
     "\n",
     "method_y =~ ",
-    paste(cr_items_y, collapse = " + ")
+    paste(cr_items_y, collapse = " + "),
+    "\n",
+    "general ~~ 0*method_p\n",
+    "general ~~ 0*method_y"
   )
-  fit_bf <- tryCatch(
+  fit_m2 <- tryCatch(
     lavaan::cfa(
-      mod_bf,
-      data = dat,
-      ordered = cr_items,
-      estimator = "WLSMV",
-      missing = "pairwise",
-      orthogonal = TRUE # general ⊥ method factors
-    ),
-    error = function(e) {
-      message("bifactor CFA failed: ", e$message)
-      NULL
-    }
-  )
-
-  # Model C — single general factor (most constrained)
-  mod_1f <- paste("pub =~", paste(cr_items, collapse = " + "))
-  fit_1f <- tryCatch(
-    lavaan::cfa(
-      mod_1f,
+      mod_m2,
       data = dat,
       ordered = cr_items,
       estimator = "WLSMV",
       missing = "pairwise"
     ),
     error = function(e) {
-      message("1-factor CFA failed: ", e$message)
+      message("Model 2 (trait + free methods) failed: ", e$message)
+      NULL
+    }
+  )
+
+  # Model 3: puberty trait, perfectly correlated methods (single factor)
+  # Method factors contribute no unique variance beyond the trait.
+  mod_m3 <- paste("pub =~", paste(cr_items, collapse = " + "))
+  fit_m3 <- tryCatch(
+    lavaan::cfa(
+      mod_m3,
+      data = dat,
+      ordered = cr_items,
+      estimator = "WLSMV",
+      missing = "pairwise"
+    ),
+    error = function(e) {
+      message("Model 3 (trait only) failed: ", e$message)
       NULL
     }
   )
@@ -501,7 +508,11 @@ run_bifactor_section <- function(
     "df.scaled"
   )
   fit_table <- lapply(
-    list(`1-factor` = fit_1f, `2-factor` = fit_2f, `bifactor` = fit_bf),
+    list(
+      `m1_no_trait` = fit_m1,
+      `m2_trait_free_meth` = fit_m2,
+      `m3_trait_only` = fit_m3
+    ),
     function(fit) fit_to_row(fit, fi_names)
   ) %>%
     bind_rows(.id = "model") %>%
@@ -513,9 +524,9 @@ run_bifactor_section <- function(
   list(
     fit_table = fit_table,
     omega = sl,
-    fit_1f = fit_1f,
-    fit_2f = fit_2f,
-    fit_bf = fit_bf
+    fit_m1 = fit_m1,
+    fit_m2 = fit_m2,
+    fit_m3 = fit_m3
   )
 }
 
@@ -539,6 +550,233 @@ bifactor_fits <- bind_rows(
 write.csv(
   bifactor_fits,
   file.path(out_dir, "bifactor_model_comparison.csv"),
+  row.names = FALSE
+)
+
+# ---------------------------------------------------------------------------
+# SECTION 2b: CROSS-REPORTER LONGITUDINAL INVARIANCE
+# Answers: does the multimethod model hold at each wave, and are the loadings
+# stable enough across waves to support a consistent longitudinal model?
+# Per-wave fits: M1/M2/M3 at each wave separately.
+# Multigroup invariance: M1 (reliable) and M2 (attempted) with wave as group.
+# ---------------------------------------------------------------------------
+
+run_cr_longitudinal_invariance <- function(
+  parent_df,
+  youth_df,
+  sex_label,
+  include_pete = FALSE
+) {
+  cat("\n\n=== Cross-reporter longitudinal invariance |", sex_label, "===\n")
+
+  base_items <- c("peta", "petb", "petc", "petd")
+  all_items <- if (include_pete) c(base_items, "fpete", "mpete") else base_items
+
+  parent_sel <- parent_df %>%
+    select(id, wave, any_of(all_items)) %>%
+    rename_with(~ paste0(., "_p"), any_of(all_items))
+
+  youth_sel <- youth_df %>%
+    select(id, wave, any_of(all_items)) %>%
+    rename_with(~ paste0(., "_y"), any_of(all_items))
+
+  dat_long <- inner_join(parent_sel, youth_sel, by = c("id", "wave")) %>%
+    mutate(
+      across(-c(id, wave), as.integer),
+      wave = factor(wave, levels = wave_order)
+    ) %>%
+    filter(if_all(-c(id, wave), ~ !is.na(.) & . %in% 1:4))
+
+  cr_items <- setdiff(names(dat_long), c("id", "wave"))
+  cr_items_p <- grep("_p$", cr_items, value = TRUE)
+  cr_items_y <- grep("_y$", cr_items, value = TRUE)
+
+  mod_m1 <- paste0(
+    "method_p =~ ",
+    paste(cr_items_p, collapse = " + "),
+    "\n",
+    "method_y =~ ",
+    paste(cr_items_y, collapse = " + ")
+  )
+  mod_m2 <- paste0(
+    "general  =~ ",
+    paste(cr_items, collapse = " + "),
+    "\n",
+    "method_p =~ ",
+    paste(cr_items_p, collapse = " + "),
+    "\n",
+    "method_y =~ ",
+    paste(cr_items_y, collapse = " + "),
+    "\n",
+    "general ~~ 0*method_p\n",
+    "general ~~ 0*method_y"
+  )
+  mod_m3 <- paste("pub =~", paste(cr_items, collapse = " + "))
+
+  fi_names <- c(
+    "cfi.scaled",
+    "tli.scaled",
+    "rmsea.scaled",
+    "srmr",
+    "chisq.scaled",
+    "df.scaled"
+  )
+
+  # --- Per-wave fits --------------------------------------------------------
+  cat("\n--- Per-wave fits (M1 / M2 / M3) ---\n")
+  wave_fits <- lapply(wave_order, function(wv) {
+    sub <- dat_long %>% filter(wave == wv) %>% select(all_of(cr_items))
+    if (nrow(sub) < 100) {
+      return(NULL)
+    }
+    lapply(
+      list(
+        m1_no_trait = mod_m1,
+        m2_trait_free_meth = mod_m2,
+        m3_trait_only = mod_m3
+      ),
+      function(mod) {
+        fit <- tryCatch(
+          lavaan::cfa(
+            mod,
+            data = sub,
+            ordered = cr_items,
+            estimator = "WLSMV",
+            missing = "pairwise"
+          ),
+          error = function(e) NULL
+        )
+        row <- fit_to_row(fit, fi_names)
+        if (!is.null(row)) mutate(row, wave = wv) else NULL
+      }
+    ) %>%
+      bind_rows(.id = "model") %>%
+      mutate(sex = sex_label)
+  }) %>%
+    bind_rows()
+
+  print_all(wave_fits)
+
+  # --- Multigroup invariance across waves -----------------------------------
+  dat_grp <- dat_long %>%
+    select(-id) %>%
+    filter(!is.na(wave)) %>%
+    mutate(across(all_of(cr_items), ~ as.ordered(.)))
+
+  fi_inv <- c("cfi.scaled", "tli.scaled", "rmsea.scaled", "srmr")
+  inv_levels <- list(
+    configural = character(0),
+    metric = "loadings",
+    scalar = c("loadings", "thresholds")
+  )
+
+  run_mg_inv <- function(mod, label) {
+    fits <- lapply(inv_levels, function(ge) {
+      tryCatch(
+        lavaan::cfa(
+          mod,
+          data = dat_grp,
+          group = "wave",
+          ordered = cr_items,
+          estimator = "WLSMV",
+          parameterization = "theta",
+          group.equal = ge
+        ),
+        error = function(e) {
+          message(
+            sex_label,
+            " ",
+            label,
+            " [",
+            paste(ge, collapse = "+"),
+            "]: ",
+            e$message
+          )
+          NULL
+        }
+      )
+    })
+    tbl <- lapply(fits, function(fit) fit_to_row(fit, fi_inv)) %>%
+      bind_rows(.id = "model") %>%
+      mutate(sex = sex_label, multimethod_model = label)
+    cfg_cfi <- tbl$cfi.scaled[tbl$model == "configural"]
+    tbl$delta_cfi <- if (length(cfg_cfi) == 1 && !is.na(cfg_cfi)) {
+      tbl$cfi.scaled - cfg_cfi
+    } else {
+      NA_real_
+    }
+    tbl
+  }
+
+  cat("\n--- Multigroup invariance across waves: M1 (no-trait baseline) ---\n")
+  inv_m1 <- run_mg_inv(mod_m1, "M1_no_trait")
+  print(inv_m1)
+
+  cat(
+    "\n--- Multigroup invariance across waves: M2 (trait + free methods) ---\n"
+  )
+  inv_m2 <- run_mg_inv(mod_m2, "M2_trait_free_meth")
+  print(inv_m2)
+
+  list(wave_fits = wave_fits, inv_m1 = inv_m1, inv_m2 = inv_m2)
+}
+
+# Run with pete items — shows full picture including per-wave failures at
+# baseline due to fpete floor effects; useful for diagnosing item behaviour.
+cr_long_female <- run_cr_longitudinal_invariance(
+  female_parent,
+  female_youth,
+  "female",
+  include_pete = TRUE
+)
+cr_long_male <- run_cr_longitudinal_invariance(
+  male_parent,
+  male_youth,
+  "male",
+  include_pete = TRUE
+)
+
+cr_wave_fits <- bind_rows(cr_long_female$wave_fits, cr_long_male$wave_fits)
+write.csv(
+  cr_wave_fits,
+  file.path(out_dir, "cr_per_wave_fits_with_pete.csv"),
+  row.names = FALSE
+)
+
+# Run without pete items — ordinal-only (peta–petd) for stable multigroup
+# invariance estimates unaffected by fpete floor effects at early waves.
+cr_long_female_ord <- run_cr_longitudinal_invariance(
+  female_parent,
+  female_youth,
+  "female",
+  include_pete = FALSE
+)
+cr_long_male_ord <- run_cr_longitudinal_invariance(
+  male_parent,
+  male_youth,
+  "male",
+  include_pete = FALSE
+)
+
+cr_wave_fits_ord <- bind_rows(
+  cr_long_female_ord$wave_fits,
+  cr_long_male_ord$wave_fits
+)
+write.csv(
+  cr_wave_fits_ord,
+  file.path(out_dir, "cr_per_wave_fits_ordinal.csv"),
+  row.names = FALSE
+)
+
+cr_inv_table <- bind_rows(
+  cr_long_female_ord$inv_m1,
+  cr_long_female_ord$inv_m2,
+  cr_long_male_ord$inv_m1,
+  cr_long_male_ord$inv_m2
+)
+write.csv(
+  cr_inv_table,
+  file.path(out_dir, "cr_longitudinal_invariance.csv"),
   row.names = FALSE
 )
 
