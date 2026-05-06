@@ -28,7 +28,7 @@ set.seed(90025)
 #     near-constant across individuals (no meaningful individual variance).
 #   peak_velocity — population smooth's peak derivative; literally one value
 #     per dataset.
-LPA_VARS <- c("timing", "obs_tempo")
+LPA_VARS <- c("timing_dev", "acceleration")
 N_PROFILES <- 1:6
 # tidyLPA model numbers (mclust parameterisation):
 #   1 = EEI  equal variance, zero covariance
