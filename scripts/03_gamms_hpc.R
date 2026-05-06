@@ -8,14 +8,15 @@
 ##   nthreads: integer, default 4
 ##
 ## Model:
-##   pds_comp ~ s(age, k=6) + s(age, id_fac, bs="fs", k=4, m=2)
-##   s(age): population mean trajectory
-##   s(age, id_fac, bs="fs"): individual deviations (random smooth slopes)
-##   m=2 penalizes second derivative of individual deviation → allows each
-##   person's curve to deviate linearly from population (random intercepts
-##   AND slopes). This is critical: m=1 would penalize first derivative,
-##   collapsing individuals to random intercepts only and making tempo a
-##   mathematical function of timing.
+##   pds_comp ~ s(age, k=6) + s(id_fac, bs="re") + s(id_fac, age, bs="re")
+##   s(age, k=6):             population nonlinear mean trajectory
+##   s(id_fac, bs="re"):      random intercept per person  → individual timing
+##   s(id_fac, age, bs="re"): random slope of age per person → individual tempo
+##
+## Why not bs="fs"?
+##   bs="fs" m=1 → random intercepts only (all curves same shape; tempo = f(timing))
+##   bs="fs" m=2 → random intercepts + slopes, but basis is k×N → OOMs at 32GB
+##   bs="re" intercept + slope → same 2 df/person as m=2, basis is 2×N → fits 32GB
 
 ## to do: add model for each item (other than pete for females, since its binary. that would need to be a different model?)
 
@@ -96,18 +97,21 @@ cat(
 )
 
 # ---------------------------------------------------------------------------
-# FIT FACTOR-SMOOTH GAMM
+# FIT GAMM WITH RANDOM INTERCEPTS + SLOPES
 #
-# s(age, k=6):                        population mean trajectory
-# s(age, id_fac, bs="fs", k=6, m=1): person-specific deviations from mean
-#   bs="fs" = factor-smooth interaction
-#   m=1     = first-derivative penalty on individual deviations
-#             (encourages individual curves to be smooth perturbations of mean)
+# s(age, k=6):             nonlinear population trajectory
+# s(id_fac, bs="re"):      random intercept per person (vertical shift = timing)
+# s(id_fac, age, bs="re"): random slope of age per person (growth rate = tempo)
+#
+# This formulation gives each person 2 degrees of freedom (intercept + slope),
+# identical to a linear mixed model random effects structure but with a
+# nonlinear population smooth. Basis size is 2×N (vs k×N for bs="fs"),
+# so it fits comfortably within 32GB nodes.
 #
 # discrete=TRUE + nthreads speeds up bam() substantially at ABCD N.
 # Expect ~30–90 min per dataset on Hoffman2 depending on N.
 # ---------------------------------------------------------------------------
-rds_path <- file.path(out_dir, paste0(ds_name, "_gamm_fs.rds"))
+rds_path <- file.path(out_dir, paste0(ds_name, "_gamm_re.rds"))
 
 t0 <- proc.time()
 
@@ -115,10 +119,13 @@ if (file.exists(rds_path)) {
   cat("\nLoading existing model from:", rds_path, "\n")
   m <- readRDS(rds_path)
 } else {
-  cat("\nFitting factor-smooth GAMM (this takes a while)...\n")
+  cat(
+    "\nFitting GAMM with random intercepts + slopes (this takes a while)...\n"
+  )
   m <- mgcv::bam(
     pds_comp ~ s(age, k = 6) +
-      s(age, id_fac, bs = "fs", k = 4, m = 2),
+      s(id_fac, bs = "re") +
+      s(id_fac, age, bs = "re"),
     data = df,
     method = "fREML",
     discrete = TRUE,
@@ -131,12 +138,49 @@ if (file.exists(rds_path)) {
 }
 
 # ---------------------------------------------------------------------------
+# EXTRACT INDIVIDUAL RANDOM SLOPES (gamm_tempo)
+#
+# Coefficients of s(id_fac, age, bs="re") are the random slope deviations —
+# one per person in levels(id_fac) order. A positive value means the person's
+# PDS increases faster per year than the population average (faster tempo).
+# ---------------------------------------------------------------------------
+gamm_tempo_vec <- tryCatch(
+  {
+    all_coef <- coef(m)
+    # find the smooth whose terms are exactly c("id_fac", "age")
+    slope_smooth <- Filter(
+      function(s) {
+        length(s$term) == 2L &&
+          "id_fac" %in% s$term &&
+          "age" %in% s$term
+      },
+      m$smooth
+    )
+    if (length(slope_smooth) == 1L) {
+      s <- slope_smooth[[1]]
+      vals <- as.numeric(all_coef[s$first.para:s$last.para])
+      cat("gamm_tempo extracted for", length(vals), "participants\n")
+      vals
+    } else {
+      cat(
+        "Warning: could not locate random slope smooth — gamm_tempo set to NA\n"
+      )
+      rep(NA_real_, n_ids)
+    }
+  },
+  error = function(e) {
+    cat("Warning: gamm_tempo extraction failed:", e$message, "\n")
+    rep(NA_real_, n_ids)
+  }
+)
+
+# ---------------------------------------------------------------------------
 # INDIVIDUAL TIMING + TEMPO
 #
 # Saved immediately after the model so this CSV is written even if the
 # gratia or per-item sections fail (they are more memory-intensive).
 # ---------------------------------------------------------------------------
-PDS_ONSET_THRESH <- 3.0
+PDS_ONSET_THRESH <- 2.5
 AGE_FINE_MIN <- 7
 AGE_FINE_MAX <- 20
 AGE_FINE_N <- 300
@@ -180,65 +224,56 @@ deriv_mat[2:(AGE_FINE_N - 1), ] <-
 
 cat("Deriving timing and tempo...\n")
 
-# Completion = when predicted PDS reaches 95% of the individual's predicted max.
-# tempo = (PDS_at_completion - PDS_at_onset) / (age_at_completion - age_at_onset)
-#         i.e. average PDS gain per year during the active pubertal window.
-# With m=2 in the fs smooth, individual deviations can be linear in age
-# (random intercepts + slopes), so peak_velocity and tempo genuinely vary
-# across individuals rather than being fixed by the population curve shape.
-PDS_COMPLETION_PCT <- 0.95
+# Definitions:
+#   timing      = age at which individual predicted PDS first reaches 2.5
+#   timing_dev  = timing - mean(timing): deviation from cohort-average onset age
+#                 negative = earlier than average; positive = later
+#   acceleration = d²(PDS)/d(age²) at the onset point (PDS = 2.5)
+#                 captures how rapidly the growth rate is increasing at onset
+#                 (higher = puberty "taking off" faster = faster tempo)
+#   peak_velocity = max d(PDS)/d(age) across age range (kept for reference)
+#   gamm_tempo  = random slope from bs="re" term (individual deviation in
+#                 overall growth rate; also a valid tempo index)
 
-timing_vec        <- rep(NA_real_, n_ids)
+# Second derivative via central differences of the first derivative.
+# Valid for rows 3:(AGE_FINE_N-2); endpoints left as NA.
+deriv2_mat <- matrix(NA_real_, nrow = AGE_FINE_N, ncol = n_ids)
+deriv2_mat[3:(AGE_FINE_N - 2L), ] <-
+  (deriv_mat[4:(AGE_FINE_N - 1L), ] - deriv_mat[2:(AGE_FINE_N - 3L), ]) /
+  (2 * da)
+
+timing_vec <- rep(NA_real_, n_ids)
+acceleration_vec <- rep(NA_real_, n_ids)
 peak_velocity_vec <- rep(NA_real_, n_ids)
-duration_vec      <- rep(NA_real_, n_ids)
-tempo_vec         <- rep(NA_real_, n_ids)
 
 for (j in seq_len(n_ids)) {
   traj <- pred_mat[, j]
-  d    <- deriv_mat[, j]
-  cross <- which(traj >= PDS_ONSET_THRESH)
-  if (length(cross) > 0) {
-    onset_idx  <- cross[1]
-    timing_vec[j] <- age_fine[onset_idx]
+  d <- deriv_mat[, j]
+  d2 <- deriv2_mat[, j]
 
-    # completion: first point at/after onset where PDS >= 95% of individual max
-    ind_max   <- max(traj, na.rm = TRUE)
-    compl     <- which(traj[onset_idx:length(traj)] >= PDS_COMPLETION_PCT * ind_max)
-    if (length(compl) > 0) {
-      compl_idx <- onset_idx + compl[1] - 1L
-      dur <- age_fine[compl_idx] - age_fine[onset_idx]
-      duration_vec[j] <- dur
-      if (dur > 0) {
-        tempo_vec[j] <- (traj[compl_idx] - traj[onset_idx]) / dur
-      }
-    }
+  cross <- which(traj >= PDS_ONSET_THRESH)
+  if (length(cross) > 0L) {
+    onset_idx <- cross[1L]
+    timing_vec[j] <- age_fine[onset_idx]
+    acceleration_vec[j] <- d2[onset_idx]
   }
   peak_velocity_vec[j] <- max(d, na.rm = TRUE)
 }
 
-# Empirical tempo: OLS slope of observed pds_comp ~ age per person.
-# This is independent of the GAMM penalty and serves as a direct check.
-obs_slopes <- df %>%
-  group_by(id) %>%
-  filter(n() >= 2L) %>%
-  summarise(
-    obs_tempo = tryCatch(
-      coef(lm(pds_comp ~ age))[["age"]],
-      error = function(e) NA_real_
-    ),
-    .groups = "drop"
-  )
+# Timing deviation: centred within this dataset so that early vs. late is
+# expressed relative to the cohort rather than as a raw age.
+timing_dev_vec <- timing_vec - mean(timing_vec, na.rm = TRUE)
 
 timing_tempo <- data.frame(
-  id            = id_levels,
-  timing        = timing_vec,
+  id = id_levels,
+  timing = timing_vec,
+  timing_dev = timing_dev_vec,
+  acceleration = acceleration_vec,
   peak_velocity = peak_velocity_vec,
-  duration      = duration_vec,
-  tempo         = tempo_vec,
-  dataset       = ds_name,
+  gamm_tempo = gamm_tempo_vec,
+  dataset = ds_name,
   stringsAsFactors = FALSE
-) %>%
-  left_join(obs_slopes, by = "id")
+)
 
 cat(
   "N with timing:",
@@ -264,9 +299,9 @@ sample_idx <- sample(seq_len(n_ids), n_sample)
 
 # long-form data for sampled trajectories
 traj_df <- data.frame(
-  age    = rep(age_fine, times = n_sample),
-  pred   = as.vector(pred_mat[, sample_idx]),
-  id     = rep(id_levels[sample_idx], each = AGE_FINE_N)
+  age = rep(age_fine, times = n_sample),
+  pred = as.vector(pred_mat[, sample_idx]),
+  id = rep(id_levels[sample_idx], each = AGE_FINE_N)
 )
 
 # attach timing for colour coding
@@ -274,40 +309,61 @@ timing_lookup <- timing_tempo[, c("id", "timing")]
 traj_df <- merge(traj_df, timing_lookup, by = "id", all.x = TRUE)
 
 # tertile-based colour label
-tert <- quantile(timing_tempo$timing, probs = c(1/3, 2/3), na.rm = TRUE)
+tert <- quantile(timing_tempo$timing, probs = c(1 / 3, 2 / 3), na.rm = TRUE)
 traj_df$timing_group <- cut(
   traj_df$timing,
   breaks = c(-Inf, tert[1], tert[2], Inf),
   labels = c("Early", "On-time", "Late"),
-  right  = TRUE
+  right = TRUE
 )
 traj_df$timing_group[is.na(traj_df$timing_group)] <- "No onset"
 
 # population mean from pred_mat (mean across ALL participants, not just sample)
 pop_mean_df <- data.frame(
-  age  = age_fine,
+  age = age_fine,
   pred = rowMeans(pred_mat)
 )
 
-p_traj <- ggplot(traj_df, aes(x = age, y = pred, group = id,
-                               colour = timing_group)) +
+p_traj <- ggplot(
+  traj_df,
+  aes(x = age, y = pred, group = id, colour = timing_group)
+) +
   geom_line(alpha = 0.18, linewidth = 0.3) +
-  geom_line(data = pop_mean_df, aes(x = age, y = pred, group = NULL),
-            colour = "black", linewidth = 1.2, inherit.aes = FALSE) +
-  geom_hline(yintercept = PDS_ONSET_THRESH,
-             linetype = "dashed", colour = "grey40", linewidth = 0.6) +
+  geom_line(
+    data = pop_mean_df,
+    aes(x = age, y = pred, group = NULL),
+    colour = "black",
+    linewidth = 1.2,
+    inherit.aes = FALSE
+  ) +
+  geom_hline(
+    yintercept = PDS_ONSET_THRESH,
+    linetype = "dashed",
+    colour = "grey40",
+    linewidth = 0.6
+  ) +
   scale_colour_manual(
-    values = c(Early = "#d73027", `On-time` = "#4575b4",
-               Late  = "#1a9850", `No onset` = "grey60"),
+    values = c(
+      Early = "#d73027",
+      `On-time` = "#4575b4",
+      Late = "#1a9850",
+      `No onset` = "grey60"
+    ),
     na.value = "grey60"
   ) +
   labs(
-    title    = paste("Individual pubertal trajectories:", ds_name),
-    subtitle = paste0("n = ", n_sample, " sampled; black = population mean; ",
-                      "dashed = onset threshold (PDS = ", PDS_ONSET_THRESH, ")"),
-    x        = "Age (years)",
-    y        = "Fitted PDS composite",
-    colour   = "Timing"
+    title = paste("Individual pubertal trajectories:", ds_name),
+    subtitle = paste0(
+      "n = ",
+      n_sample,
+      " sampled; black = population mean; ",
+      "dashed = onset threshold (PDS = ",
+      PDS_ONSET_THRESH,
+      ")"
+    ),
+    x = "Age (years)",
+    y = "Fitted PDS composite",
+    colour = "Timing"
   ) +
   theme_minimal(base_size = 13) +
   theme(legend.position = "bottom")
@@ -315,9 +371,9 @@ p_traj <- ggplot(traj_df, aes(x = age, y = pred, group = id,
 ggsave(
   file.path(out_dir, paste0(ds_name, "_individual_trajectories.png")),
   p_traj,
-  width  = 8,
+  width = 8,
   height = 5,
-  dpi    = 150
+  dpi = 150
 )
 cat("Individual trajectory plot saved.\n")
 
@@ -382,116 +438,125 @@ ggsave(
 # Exclude the fs term to get the mean trajectory only.
 # Wrapped in tryCatch so an OOM or gratia error does not abort per-item models.
 # ---------------------------------------------------------------------------
-tryCatch({
+tryCatch(
+  {
+    AGE_GRID_N <- 300
 
-AGE_GRID_N <- 300
+    # Try column names in order; error with diagnostics if none found
+    safe_col <- function(df, ...) {
+      candidates <- c(...)
+      found <- intersect(candidates, names(df))
+      if (length(found) == 0) {
+        stop(
+          "None of (",
+          paste(candidates, collapse = ", "),
+          ") found. Columns present: ",
+          paste(names(df), collapse = ", ")
+        )
+      }
+      found[1]
+    }
 
-# Try column names in order; error with diagnostics if none found
-safe_col <- function(df, ...) {
-  candidates <- c(...)
-  found <- intersect(candidates, names(df))
-  if (length(found) == 0) {
-    stop(
-      "None of (",
-      paste(candidates, collapse = ", "),
-      ") found. Columns present: ",
-      paste(names(df), collapse = ", ")
+    sm <- gratia::smooth_estimates(m, smooth = "s(age)", n = AGE_GRID_N)
+    cat("smooth_estimates columns:", paste(names(sm), collapse = ", "), "\n")
+
+    # gratia 0.8.x: covariate in "age" or "data"; estimate/se without dots
+    # gratia 0.9.x+: covariate in ".smooth_covar"; estimate/se with dots
+    sm_age <- safe_col(sm, "age", "data", ".smooth_covar")
+    sm_est <- safe_col(sm, "est", ".estimate")
+    sm_se <- safe_col(sm, "se", ".se")
+
+    d1 <- gratia::derivatives(
+      m,
+      term = "s(age)",
+      n = AGE_GRID_N,
+      type = "central",
+      interval = "simultaneous"
+    )
+    cat("derivatives columns:", paste(names(d1), collapse = ", "), "\n")
+
+    # gratia 0.8.x: covariate in "data" (with "var" holding name); 0.9.x+: actual name
+    d_age <- safe_col(d1, "data", "age", ".smooth_covar")
+    d_deriv <- safe_col(d1, "derivative", ".derivative")
+    d_se <- safe_col(d1, "se", ".se")
+
+    write.csv(
+      sm %>% mutate(dataset = ds_name),
+      file.path(out_dir, paste0(ds_name, "_population_smooth.csv")),
+      row.names = FALSE
+    )
+    write.csv(
+      d1 %>% mutate(dataset = ds_name),
+      file.path(out_dir, paste0(ds_name, "_population_derivative.csv")),
+      row.names = FALSE
+    )
+
+    # Population smooth plot
+    p_smooth <- ggplot(sm, aes(x = .data[[sm_age]], y = .data[[sm_est]])) +
+      geom_ribbon(
+        aes(
+          ymin = .data[[sm_est]] - 2 * .data[[sm_se]],
+          ymax = .data[[sm_est]] + 2 * .data[[sm_se]]
+        ),
+        alpha = 0.2,
+        fill = "steelblue"
+      ) +
+      geom_line(linewidth = 1, colour = "steelblue4") +
+      labs(
+        title = paste("Population PDS trajectory:", ds_name),
+        x = "Age (years)",
+        y = "PDS composite (population smooth)"
+      ) +
+      theme_minimal(base_size = 13)
+
+    ggsave(
+      file.path(out_dir, paste0(ds_name, "_population_smooth.png")),
+      p_smooth,
+      width = 7,
+      height = 5,
+      dpi = 150
+    )
+
+    # Velocity plot
+    p_deriv <- ggplot(d1, aes(x = .data[[d_age]], y = .data[[d_deriv]])) +
+      geom_ribbon(
+        aes(
+          ymin = .data[[d_deriv]] - 2 * .data[[d_se]],
+          ymax = .data[[d_deriv]] + 2 * .data[[d_se]]
+        ),
+        alpha = 0.2,
+        fill = "darkorange"
+      ) +
+      geom_line(linewidth = 1, colour = "darkorange3") +
+      geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+      labs(
+        title = paste("Pubertal velocity:", ds_name),
+        x = "Age (years)",
+        y = "d(PDS)/d(age) per year"
+      ) +
+      theme_minimal(base_size = 13)
+
+    ggsave(
+      file.path(out_dir, paste0(ds_name, "_growth_velocity.png")),
+      p_deriv,
+      width = 7,
+      height = 5,
+      dpi = 150
+    )
+  },
+  error = function(e) {
+    cat(
+      "\n[WARNING] Gratia section failed for",
+      ds_name,
+      "—",
+      conditionMessage(e),
+      "\n"
+    )
+    cat(
+      "Skipping population smooth/derivative plots. Continuing to per-item models.\n\n"
     )
   }
-  found[1]
-}
-
-sm <- gratia::smooth_estimates(m, smooth = "s(age)", n = AGE_GRID_N)
-cat("smooth_estimates columns:", paste(names(sm), collapse = ", "), "\n")
-
-# gratia 0.8.x: covariate in "age" or "data"; estimate/se without dots
-# gratia 0.9.x+: covariate in ".smooth_covar"; estimate/se with dots
-sm_age <- safe_col(sm, "age", "data", ".smooth_covar")
-sm_est <- safe_col(sm, "est", ".estimate")
-sm_se <- safe_col(sm, "se", ".se")
-
-d1 <- gratia::derivatives(
-  m,
-  term = "s(age)",
-  n = AGE_GRID_N,
-  type = "central",
-  interval = "simultaneous"
 )
-cat("derivatives columns:", paste(names(d1), collapse = ", "), "\n")
-
-# gratia 0.8.x: covariate in "data" (with "var" holding name); 0.9.x+: actual name
-d_age <- safe_col(d1, "data", "age", ".smooth_covar")
-d_deriv <- safe_col(d1, "derivative", ".derivative")
-d_se <- safe_col(d1, "se", ".se")
-
-write.csv(
-  sm %>% mutate(dataset = ds_name),
-  file.path(out_dir, paste0(ds_name, "_population_smooth.csv")),
-  row.names = FALSE
-)
-write.csv(
-  d1 %>% mutate(dataset = ds_name),
-  file.path(out_dir, paste0(ds_name, "_population_derivative.csv")),
-  row.names = FALSE
-)
-
-# Population smooth plot
-p_smooth <- ggplot(sm, aes(x = .data[[sm_age]], y = .data[[sm_est]])) +
-  geom_ribbon(
-    aes(
-      ymin = .data[[sm_est]] - 2 * .data[[sm_se]],
-      ymax = .data[[sm_est]] + 2 * .data[[sm_se]]
-    ),
-    alpha = 0.2,
-    fill = "steelblue"
-  ) +
-  geom_line(linewidth = 1, colour = "steelblue4") +
-  labs(
-    title = paste("Population PDS trajectory:", ds_name),
-    x = "Age (years)",
-    y = "PDS composite (population smooth)"
-  ) +
-  theme_minimal(base_size = 13)
-
-ggsave(
-  file.path(out_dir, paste0(ds_name, "_population_smooth.png")),
-  p_smooth,
-  width = 7,
-  height = 5,
-  dpi = 150
-)
-
-# Velocity plot
-p_deriv <- ggplot(d1, aes(x = .data[[d_age]], y = .data[[d_deriv]])) +
-  geom_ribbon(
-    aes(
-      ymin = .data[[d_deriv]] - 2 * .data[[d_se]],
-      ymax = .data[[d_deriv]] + 2 * .data[[d_se]]
-    ),
-    alpha = 0.2,
-    fill = "darkorange"
-  ) +
-  geom_line(linewidth = 1, colour = "darkorange3") +
-  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
-  labs(
-    title = paste("Pubertal velocity:", ds_name),
-    x = "Age (years)",
-    y = "d(PDS)/d(age) per year"
-  ) +
-  theme_minimal(base_size = 13)
-
-ggsave(
-  file.path(out_dir, paste0(ds_name, "_growth_velocity.png")),
-  p_deriv,
-  width = 7,
-  height = 5,
-  dpi = 150
-)
-
-}, error = function(e) {
-  cat("\n[WARNING] Gratia section failed for", ds_name, "—", conditionMessage(e), "\n")
-  cat("Skipping population smooth/derivative plots. Continuing to per-item models.\n\n")
-})
 
 # ---------------------------------------------------------------------------
 # PER-ITEM MODELS
