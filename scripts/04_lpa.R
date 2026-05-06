@@ -125,6 +125,37 @@ tt_list[["male_averaged"]] <- build_averaged("male")
 all_labels <- c(ds_names, "female_averaged", "male_averaged")
 
 # ---------------------------------------------------------------------------
+# Extract class assignments from a tidyLPA fit without relying on get_data()
+# storing the original data (some tidyLPA versions don't attach it).
+# ---------------------------------------------------------------------------
+extract_assignments <- function(fit) {
+  # Try the official route first
+  result <- tryCatch(
+    get_data(fit) %>% select(Class, starts_with("CPROB")),
+    error = function(e) NULL
+  )
+  if (!is.null(result)) return(result)
+
+  # Fall back: pull the mclust object from the tidyProfile/tidyLPA structure
+  mc <- NULL
+  for (.acc in list(
+    function(f) f$fit,
+    function(f) f[[1]]$fit,
+    function(f) f$model_object,
+    function(f) f[[1]]$model_object
+  )) {
+    mc <- tryCatch(.acc(fit), error = function(e) NULL)
+    if (!is.null(mc) && inherits(mc, "Mclust")) break
+    mc <- NULL
+  }
+  if (is.null(mc)) stop("Cannot extract class assignments from tidyLPA fit.")
+
+  probs <- as.data.frame(mc$z)
+  names(probs) <- paste0("CPROB", seq_len(ncol(mc$z)))
+  bind_cols(data.frame(Class = as.integer(mc$classification)), probs)
+}
+
+# ---------------------------------------------------------------------------
 # LPA HELPER
 # ---------------------------------------------------------------------------
 run_lpa <- function(df, label) {
@@ -279,8 +310,7 @@ run_lpa <- function(df, label) {
   fit_best <- valid_fits[[best_key]]$fit
   cat("\nBIC-optimal solution: K =", best_k, "| model =", best_model, "\n")
 
-  assigns <- get_data(fit_best) %>%
-    select(Class, starts_with("CPROB")) %>%
+  assigns <- extract_assignments(fit_best) %>%
     bind_cols(df_cc %>% select(id, all_of(LPA_VARS)))
 
   write.csv(
@@ -386,8 +416,7 @@ run_lpa <- function(df, label) {
       next
     }
 
-    asgn_k <- get_data(fit_k) %>%
-      select(Class, starts_with("CPROB")) %>%
+    asgn_k <- extract_assignments(fit_k) %>%
       bind_cols(df_cc %>% select(id, all_of(LPA_VARS)))
 
     write.csv(
