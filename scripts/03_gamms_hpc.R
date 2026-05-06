@@ -214,6 +214,75 @@ tt_path <- file.path(out_dir, paste0(ds_name, "_timing_tempo.csv"))
 write.csv(timing_tempo, tt_path, row.names = FALSE)
 cat("Timing/tempo saved:", tt_path, "\n")
 
+# ---------------------------------------------------------------------------
+# INDIVIDUAL TRAJECTORY PLOT
+# Sample up to 300 participants and plot their fitted curves as thin lines,
+# with the population mean overlaid. Colour by timing (early / on-time / late
+# tertiles) so the reader can see how the spread relates to onset age.
+# ---------------------------------------------------------------------------
+set.seed(90025)
+n_sample <- min(300L, n_ids)
+sample_idx <- sample(seq_len(n_ids), n_sample)
+
+# long-form data for sampled trajectories
+traj_df <- data.frame(
+  age    = rep(age_fine, times = n_sample),
+  pred   = as.vector(pred_mat[, sample_idx]),
+  id     = rep(id_levels[sample_idx], each = AGE_FINE_N)
+)
+
+# attach timing for colour coding
+timing_lookup <- timing_tempo[, c("id", "timing")]
+traj_df <- merge(traj_df, timing_lookup, by = "id", all.x = TRUE)
+
+# tertile-based colour label
+tert <- quantile(timing_tempo$timing, probs = c(1/3, 2/3), na.rm = TRUE)
+traj_df$timing_group <- cut(
+  traj_df$timing,
+  breaks = c(-Inf, tert[1], tert[2], Inf),
+  labels = c("Early", "On-time", "Late"),
+  right  = TRUE
+)
+traj_df$timing_group[is.na(traj_df$timing_group)] <- "No onset"
+
+# population mean from pred_mat (mean across ALL participants, not just sample)
+pop_mean_df <- data.frame(
+  age  = age_fine,
+  pred = rowMeans(pred_mat)
+)
+
+p_traj <- ggplot(traj_df, aes(x = age, y = pred, group = id,
+                               colour = timing_group)) +
+  geom_line(alpha = 0.18, linewidth = 0.3) +
+  geom_line(data = pop_mean_df, aes(x = age, y = pred, group = NULL),
+            colour = "black", linewidth = 1.2, inherit.aes = FALSE) +
+  geom_hline(yintercept = PDS_ONSET_THRESH,
+             linetype = "dashed", colour = "grey40", linewidth = 0.6) +
+  scale_colour_manual(
+    values = c(Early = "#d73027", `On-time` = "#4575b4",
+               Late  = "#1a9850", `No onset` = "grey60"),
+    na.value = "grey60"
+  ) +
+  labs(
+    title    = paste("Individual pubertal trajectories:", ds_name),
+    subtitle = paste0("n = ", n_sample, " sampled; black = population mean; ",
+                      "dashed = onset threshold (PDS = ", PDS_ONSET_THRESH, ")"),
+    x        = "Age (years)",
+    y        = "Fitted PDS composite",
+    colour   = "Timing"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+
+ggsave(
+  file.path(out_dir, paste0(ds_name, "_individual_trajectories.png")),
+  p_traj,
+  width  = 8,
+  height = 5,
+  dpi    = 150
+)
+cat("Individual trajectory plot saved.\n")
+
 p_t <- ggplot(timing_tempo %>% filter(!is.na(timing)), aes(x = timing)) +
   geom_histogram(binwidth = 0.25, fill = "steelblue", colour = "white") +
   labs(
@@ -273,7 +342,10 @@ ggsave(
 # ---------------------------------------------------------------------------
 # POPULATION SMOOTH + DERIVATIVE  (gratia)
 # Exclude the fs term to get the mean trajectory only.
+# Wrapped in tryCatch so an OOM or gratia error does not abort per-item models.
 # ---------------------------------------------------------------------------
+tryCatch({
+
 AGE_GRID_N <- 300
 
 # Try column names in order; error with diagnostics if none found
@@ -377,6 +449,11 @@ ggsave(
   height = 5,
   dpi = 150
 )
+
+}, error = function(e) {
+  cat("\n[WARNING] Gratia section failed for", ds_name, "—", conditionMessage(e), "\n")
+  cat("Skipping population smooth/derivative plots. Continuing to per-item models.\n\n")
+})
 
 # ---------------------------------------------------------------------------
 # PER-ITEM MODELS

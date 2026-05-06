@@ -460,6 +460,48 @@ img(file.path(gamm_dir, "male_youth_growth_velocity.png"))
 :::
 ::::
 
+## Individual Trajectories — Females
+
+:::: {.columns}
+::: {.column width="50%"}
+**Parent report**
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "female_parent_individual_trajectories.png"))
+```
+:::
+::: {.column width="50%"}
+**Youth report**
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "female_youth_individual_trajectories.png"))
+```
+:::
+::::
+
+::: {.notes}
+300 randomly sampled participants. Colour = timing tertile (red = early, blue = on-time, green = late, grey = no onset detected within observation window). Bold black = population mean. Dashed line = onset threshold (PDS = 3.0).
+:::
+
+## Individual Trajectories — Males
+
+:::: {.columns}
+::: {.column width="50%"}
+**Parent report**
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "male_parent_individual_trajectories.png"))
+```
+:::
+::: {.column width="50%"}
+**Youth report**
+```{r}
+#| out-width: "100%"
+img(file.path(gamm_dir, "male_youth_individual_trajectories.png"))
+```
+:::
+::::
+
 # Individual Timing & Tempo {background-color="#f5f5f5"}
 
 ## Distribution of Onset Age
