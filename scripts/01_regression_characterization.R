@@ -40,7 +40,7 @@ out_base <- Sys.getenv("OUT_DIR")
 if (!nzchar(out_base)) {
   out_base <- file.path(
     root_path,
-    "Library/CloudStorage/Box-Box/everything/projects/abcd-projs",
+    "projects/abcd-projs",
     "dissertation/study1/outputs"
   )
 }
